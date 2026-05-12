@@ -9,6 +9,13 @@ Two-month AI application development learning project for building an employable
 - SSE streaming from backend to frontend
 - Local mock LLM mode when no API key is configured
 
+## Day 2 Scope
+
+- OpenAI-compatible model provider integration in `LLMService`
+- Backend-only `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` config
+- Real non-streaming and streaming chat responses when an API key is configured
+- Mock fallback when no API key is configured
+
 ## Start Backend
 
 ```bash
@@ -32,5 +39,5 @@ Open `http://localhost:3000`.
 
 ## Learning Path
 
-Day 2 will replace the mock LLM boundary with a real model provider and add structured output.
+Day 3 will add prompt design and structured JSON output.
 
