@@ -1,17 +1,20 @@
 "use client";
 
-import { type ReactNode, FormEvent, useMemo, useRef, useState } from "react";
+import { type ReactNode, FormEvent, useCallback, useMemo, useRef, useState } from "react";
 import {
   Bot,
   CheckCircle2,
   ClipboardList,
   Loader2,
   MessageSquare,
+  RotateCcw,
   Send,
   Sparkles,
   User,
   Wrench,
 } from "lucide-react";
+
+import { AssistantMarkdown } from "@/components/chat/AssistantMarkdown";
 
 type Role = "user" | "assistant";
 
@@ -76,7 +79,7 @@ const initialMessages: ChatMessage[] = [
     id: "welcome",
     role: "assistant",
     content:
-      "你好，我是 AgentFlow AI。Day 3 我们在 system / user 分层 Prompt 之上，用 Pydantic 校验模型返回的 JSON。",
+      "你好，我是 **AgentFlow AI**（Day 5）。本页助手气泡已支持 **Markdown** 与 `代码块`。\n\n```ts\nconst ok = true;\n```\n\n试试让我列出 SSE 消费步骤，或点「停止」验证中断。",
   },
 ];
 
@@ -104,12 +107,24 @@ const dayFourGoals = [
   "前端展示工具参数与返回摘要",
 ];
 
+const dayFiveGoals = [
+  "助手气泡：react-markdown + remark-gfm（表格、任务列表等）",
+  "代码块：复制按钮 + 滚动区域，避免撑破布局",
+  "fetch + AbortController：停止与 AbortError 不误报红条",
+  "失败可重试：同一轮 user 上下文重新拉流，避免半条拼接",
+];
+
+type ApiChatMessage = { role: Role; content: string };
+
 export default function Home() {
   const [workspace, setWorkspace] = useState<"chat" | "requirements" | "tools">("requirements");
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("用三句话解释：为什么结构化输出要在服务端做校验？");
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState("");
+  const [chatRetry, setChatRetry] = useState<{ assistantId: string; apiMessages: ApiChatMessage[] } | null>(
+    null,
+  );
   const [runtimeMode, setRuntimeMode] = useState("unknown");
   const [modelName, setModelName] = useState("gpt-4.1-mini");
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -120,6 +135,9 @@ export default function Home() {
   );
   const [toolsStreaming, setToolsStreaming] = useState(false);
   const [toolsError, setToolsError] = useState("");
+  const [toolsRetry, setToolsRetry] = useState<{ assistantId: string; apiMessages: ApiChatMessage[] } | null>(
+    null,
+  );
   const toolsAbortRef = useRef<AbortController | null>(null);
 
   const [reqText, setReqText] = useState(
@@ -134,6 +152,129 @@ export default function Home() {
   const canSendTools = useMemo(
     () => toolsInput.trim().length > 0 && !toolsStreaming,
     [toolsInput, toolsStreaming],
+  );
+
+  const runChatStream = useCallback(
+    async (apiMessages: ApiChatMessage[], assistantId: string, signal: AbortSignal) => {
+      const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: apiMessages }),
+        signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`请求失败：${response.status}`);
+      }
+      await readSseStream(response.body, (eventData) => {
+        if (eventData.type === "meta") {
+          setRuntimeMode(eventData.mocked ? "mock" : "provider");
+          setModelName((prev) => eventData.model ?? prev);
+          return;
+        }
+        if (eventData.type === "done") {
+          return;
+        }
+        if (eventData.type === "delta") {
+          setMessages((currentMessages) =>
+            currentMessages.map((message) =>
+              message.id === assistantId
+                ? { ...message, content: message.content + (eventData.content ?? "") }
+                : message,
+            ),
+          );
+        }
+      });
+    },
+    [],
+  );
+
+  const runToolsStream = useCallback(
+    async (apiMessages: ApiChatMessage[], assistantId: string, signal: AbortSignal) => {
+      const response = await fetch(`${API_BASE_URL}/api/chat/stream-tools`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: apiMessages }),
+        signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`请求失败：${response.status}`);
+      }
+
+      await readSseStream(response.body, (eventData) => {
+        if (eventData.type === "meta") {
+          setRuntimeMode(eventData.mocked ? "mock" : "provider");
+          setModelName((prev) => eventData.model ?? prev);
+          return;
+        }
+        if (eventData.type === "done") {
+          return;
+        }
+        if (eventData.type === "delta") {
+          setToolsMessages((current) =>
+            current.map((m) =>
+              m.id === assistantId ? { ...m, content: m.content + (eventData.content ?? "") } : m,
+            ),
+          );
+          return;
+        }
+        if (eventData.type === "tool_call") {
+          setToolsMessages((current) =>
+            current.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    toolTrace: [
+                      ...m.toolTrace,
+                      {
+                        toolCallId: eventData.tool_call_id,
+                        name: eventData.name,
+                        arguments: eventData.arguments,
+                        phase: "running",
+                      },
+                    ],
+                  }
+                : m,
+            ),
+          );
+          return;
+        }
+        if (eventData.type === "tool_result") {
+          setToolsMessages((current) =>
+            current.map((m) => {
+              if (m.id !== assistantId) {
+                return m;
+              }
+              const tid = eventData.tool_call_id;
+              const idx = m.toolTrace.findIndex((t) => t.toolCallId === tid);
+              if (idx >= 0) {
+                const trace = [...m.toolTrace];
+                trace[idx] = {
+                  ...trace[idx],
+                  result: eventData.content,
+                  ok: eventData.ok,
+                  phase: "done",
+                };
+                return { ...m, toolTrace: trace };
+              }
+              return {
+                ...m,
+                toolTrace: [
+                  ...m.toolTrace,
+                  {
+                    toolCallId: tid,
+                    name: eventData.name,
+                    result: eventData.content,
+                    ok: eventData.ok,
+                    phase: "done",
+                  },
+                ],
+              };
+            }),
+          );
+        }
+      });
+    },
+    [],
   );
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -162,55 +303,51 @@ export default function Home() {
     const nextMessages = [...messages, userMessage, assistantMessage];
     setMessages(nextMessages);
 
+    const apiMessages: ApiChatMessage[] = nextMessages
+      .filter((message) => message.content.trim())
+      .map((message) => ({ role: message.role, content: message.content }));
+    setChatRetry({ assistantId: assistantMessage.id, apiMessages });
+
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/chat/stream`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          messages: nextMessages
-            .filter((message) => message.content.trim())
-            .map((message) => ({
-              role: message.role,
-              content: message.content,
-            })),
-        }),
-        signal: controller.signal,
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error(`请求失败：${response.status}`);
-      }
-
-      await readSseStream(response.body, (eventData) => {
-        if (eventData.type === "meta") {
-          setRuntimeMode(eventData.mocked ? "mock" : "provider");
-          setModelName(eventData.model ?? modelName);
-          return;
-        }
-
-        if (eventData.type === "done") {
-          return;
-        }
-
-        if (eventData.type === "delta") {
-          setMessages((currentMessages) =>
-            currentMessages.map((message) =>
-              message.id === assistantMessage.id
-                ? { ...message, content: message.content + (eventData.content ?? "") }
-                : message,
-            ),
-          );
-        }
-      });
+      await runChatStream(apiMessages, assistantMessage.id, controller.signal);
+      setChatRetry(null);
     } catch (caughtError) {
-      if ((caughtError as Error).name !== "AbortError") {
-        setError((caughtError as Error).message || "请求出现异常");
+      const err = caughtError as Error;
+      if (err.name === "AbortError") {
+        setChatRetry(null);
+        return;
       }
+      setError(err.message || "请求出现异常");
+    } finally {
+      setIsStreaming(false);
+      abortControllerRef.current = null;
+    }
+  }
+
+  async function retryChat() {
+    if (!chatRetry || isStreaming) {
+      return;
+    }
+    setError("");
+    setIsStreaming(true);
+    const { assistantId, apiMessages } = chatRetry;
+    setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, content: "" } : m)));
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    try {
+      await runChatStream(apiMessages, assistantId, controller.signal);
+      setChatRetry(null);
+    } catch (caughtError) {
+      const err = caughtError as Error;
+      if (err.name === "AbortError") {
+        setChatRetry(null);
+        return;
+      }
+      setError(err.message || "请求出现异常");
     } finally {
       setIsStreaming(false);
       abortControllerRef.current = null;
@@ -283,108 +420,53 @@ export default function Home() {
     const nextMessages = [...toolsMessages, userMessage, assistantMessage];
     setToolsMessages(nextMessages);
 
+    const apiMessages: ApiChatMessage[] = nextMessages
+      .filter((m) => m.content.trim())
+      .map((m) => ({ role: m.role, content: m.content }));
+    setToolsRetry({ assistantId: assistantMessage.id, apiMessages });
+
     const controller = new AbortController();
     toolsAbortRef.current = controller;
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/chat/stream-tools`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: nextMessages
-            .filter((m) => m.content.trim())
-            .map((m) => ({ role: m.role, content: m.content })),
-        }),
-        signal: controller.signal,
-      });
-
-      if (!response.ok || !response.body) {
-        throw new Error(`请求失败：${response.status}`);
-      }
-
-      await readSseStream(response.body, (eventData) => {
-        if (eventData.type === "meta") {
-          setRuntimeMode(eventData.mocked ? "mock" : "provider");
-          setModelName(eventData.model ?? modelName);
-          return;
-        }
-
-        if (eventData.type === "done") {
-          return;
-        }
-
-        if (eventData.type === "delta") {
-          setToolsMessages((current) =>
-            current.map((m) =>
-              m.id === assistantMessage.id
-                ? { ...m, content: m.content + (eventData.content ?? "") }
-                : m,
-            ),
-          );
-          return;
-        }
-
-        if (eventData.type === "tool_call") {
-          setToolsMessages((current) =>
-            current.map((m) =>
-              m.id === assistantMessage.id
-                ? {
-                    ...m,
-                    toolTrace: [
-                      ...m.toolTrace,
-                      {
-                        toolCallId: eventData.tool_call_id,
-                        name: eventData.name,
-                        arguments: eventData.arguments,
-                        phase: "running",
-                      },
-                    ],
-                  }
-                : m,
-            ),
-          );
-          return;
-        }
-
-        if (eventData.type === "tool_result") {
-          setToolsMessages((current) =>
-            current.map((m) => {
-              if (m.id !== assistantMessage.id) {
-                return m;
-              }
-              const tid = eventData.tool_call_id;
-              const idx = m.toolTrace.findIndex((t) => t.toolCallId === tid);
-              if (idx >= 0) {
-                const trace = [...m.toolTrace];
-                trace[idx] = {
-                  ...trace[idx],
-                  result: eventData.content,
-                  ok: eventData.ok,
-                  phase: "done",
-                };
-                return { ...m, toolTrace: trace };
-              }
-              return {
-                ...m,
-                toolTrace: [
-                  ...m.toolTrace,
-                  {
-                    toolCallId: tid,
-                    name: eventData.name,
-                    result: eventData.content,
-                    ok: eventData.ok,
-                    phase: "done",
-                  },
-                ],
-              };
-            }),
-          );
-        }
-      });
+      await runToolsStream(apiMessages, assistantMessage.id, controller.signal);
+      setToolsRetry(null);
     } catch (caughtError) {
-      if ((caughtError as Error).name !== "AbortError") {
-        setToolsError((caughtError as Error).message || "请求出现异常");
+      const err = caughtError as Error;
+      if (err.name === "AbortError") {
+        setToolsRetry(null);
+        return;
       }
+      setToolsError(err.message || "请求出现异常");
+    } finally {
+      setToolsStreaming(false);
+      toolsAbortRef.current = null;
+    }
+  }
+
+  async function retryTools() {
+    if (!toolsRetry || toolsStreaming) {
+      return;
+    }
+    setToolsError("");
+    setToolsStreaming(true);
+    const { assistantId, apiMessages } = toolsRetry;
+    setToolsMessages((prev) =>
+      prev.map((m) => (m.id === assistantId ? { ...m, content: "", toolTrace: [] } : m)),
+    );
+
+    const controller = new AbortController();
+    toolsAbortRef.current = controller;
+    try {
+      await runToolsStream(apiMessages, assistantId, controller.signal);
+      setToolsRetry(null);
+    } catch (caughtError) {
+      const err = caughtError as Error;
+      if (err.name === "AbortError") {
+        setToolsRetry(null);
+        return;
+      }
+      setToolsError(err.message || "请求出现异常");
     } finally {
       setToolsStreaming(false);
       toolsAbortRef.current = null;
@@ -406,8 +488,8 @@ export default function Home() {
             </div>
             <h1 className="mt-4 text-2xl font-semibold leading-tight">AgentFlow AI</h1>
             <p className="mt-2 text-sm leading-6 text-[#627064]">
-              面向求职项目的 AI Agent 应用开发训练营。第 1 周串联 Day 3（结构化输出）与 Day 4（Tool
-              Calling），围绕同一主项目持续迭代。
+              面向求职项目的 AI Agent 应用开发训练营。第 1 周串联 Day 3（结构化输出）、Day 4（Tool Calling）与 Day
+              5（Chat 产品体验），围绕同一主项目持续迭代。
             </p>
           </div>
 
@@ -429,6 +511,18 @@ export default function Home() {
               {dayFourGoals.map((goal) => (
                 <div className="flex items-start gap-2 text-sm text-[#455047]" key={goal}>
                   <CheckCircle2 className="mt-0.5 shrink-0 text-[#2a6b8f]" size={16} aria-hidden="true" />
+                  <span>{goal}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="rounded-md border border-[#e4e7dd] bg-[#fbfcf8] p-4">
+            <h2 className="text-sm font-semibold">Day 5 目标</h2>
+            <div className="mt-3 space-y-3">
+              {dayFiveGoals.map((goal) => (
+                <div className="flex items-start gap-2 text-sm text-[#455047]" key={goal}>
+                  <CheckCircle2 className="mt-0.5 shrink-0 text-[#6b4a9a]" size={16} aria-hidden="true" />
                   <span>{goal}</span>
                 </div>
               ))}
@@ -468,7 +562,7 @@ export default function Home() {
                     ? "Day 3 · Prompt 与结构化输出"
                     : workspace === "tools"
                       ? "Day 4 · Tool Calling"
-                      : "SSE 聊天"}
+                      : "Day 5 · Chat 体验"}
                 </h2>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -506,7 +600,7 @@ export default function Home() {
                   type="button"
                 >
                   <MessageSquare size={16} aria-hidden="true" />
-                  SSE 聊天
+                  Chat 体验
                 </button>
               </div>
             </div>
@@ -621,8 +715,12 @@ export default function Home() {
                           {message.role === "assistant" && message.toolTrace.length > 0 ? (
                             <ToolTraceList trace={message.toolTrace} />
                           ) : null}
-                          {message.content ? (
-                            <div className="whitespace-pre-wrap">{message.content}</div>
+                          {message.content.trim() ? (
+                            message.role === "assistant" ? (
+                              <AssistantMarkdown content={message.content} />
+                            ) : (
+                              <div className="whitespace-pre-wrap">{message.content}</div>
+                            )
                           ) : message.role === "assistant" && toolsStreaming && isLastAssistant ? (
                             <span className="inline-flex items-center gap-2 text-[#627064]">
                               <Loader2 className="animate-spin" size={15} aria-hidden="true" />
@@ -630,7 +728,11 @@ export default function Home() {
                                 ? "正在执行工具…"
                                 : "等待模型回复…"}
                             </span>
-                          ) : null}
+                          ) : message.role === "assistant" ? (
+                            <span className="text-xs text-[#8a9589]">（本条暂无正文）</span>
+                          ) : (
+                            <div className="whitespace-pre-wrap">{message.content}</div>
+                          )}
                         </div>
                         {message.role === "user" ? <MessageAvatar role={message.role} /> : null}
                       </article>
@@ -640,8 +742,19 @@ export default function Home() {
 
                 <div className="border-t border-[#e4e7dd] bg-white p-4">
                   {toolsError ? (
-                    <div className="mb-3 rounded-md border border-[#efc6be] bg-[#fff4f1] px-3 py-2 text-sm text-[#9b3323]">
-                      {toolsError}
+                    <div className="mb-3 flex flex-col gap-2 rounded-md border border-[#efc6be] bg-[#fff4f1] px-3 py-2 text-sm text-[#9b3323] sm:flex-row sm:items-center sm:justify-between">
+                      <span className="min-w-0 flex-1">{toolsError}</span>
+                      {toolsRetry ? (
+                        <button
+                          className="inline-flex shrink-0 items-center justify-center gap-1.5 self-start rounded-md border border-[#d4a39c] bg-white px-3 py-1.5 text-xs font-medium text-[#7a2e22] transition hover:bg-[#fff8f6] disabled:cursor-not-allowed disabled:opacity-50 sm:self-auto"
+                          disabled={toolsStreaming}
+                          onClick={retryTools}
+                          type="button"
+                        >
+                          <RotateCcw size={14} aria-hidden />
+                          重试
+                        </button>
+                      ) : null}
                     </div>
                   ) : null}
                   <form className="flex flex-col gap-3 md:flex-row" onSubmit={handleToolsSubmit}>
@@ -676,37 +789,65 @@ export default function Home() {
           ) : (
             <>
               <div className="flex-1 space-y-4 overflow-y-auto bg-[#fbfcf8] p-5">
-                {messages.map((message) => (
-                  <article
-                    className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
-                    key={message.id}
-                  >
-                    {message.role === "assistant" ? (
-                      <MessageAvatar role={message.role} />
-                    ) : null}
-                    <div
-                      className={`max-w-[780px] whitespace-pre-wrap rounded-lg border px-4 py-3 text-sm leading-6 shadow-sm ${
-                        message.role === "user"
-                          ? "border-[#1f5c4d] bg-[#205f4f] text-white"
-                          : "border-[#e2e6dc] bg-white text-[#273029]"
-                      }`}
+                {messages.map((message, index) => {
+                  const isLast = index === messages.length - 1;
+                  const showChatSpinner =
+                    message.role === "assistant" &&
+                    isLast &&
+                    isStreaming &&
+                    !message.content.trim();
+
+                  return (
+                    <article
+                      className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                      key={message.id}
                     >
-                      {message.content || (
-                        <span className="inline-flex items-center gap-2 text-[#627064]">
-                          <Loader2 className="animate-spin" size={15} aria-hidden="true" />
-                          正在生成
-                        </span>
-                      )}
-                    </div>
-                    {message.role === "user" ? <MessageAvatar role={message.role} /> : null}
-                  </article>
-                ))}
+                      {message.role === "assistant" ? (
+                        <MessageAvatar role={message.role} />
+                      ) : null}
+                      <div
+                        className={`max-w-[780px] rounded-lg border px-4 py-3 text-sm leading-6 shadow-sm ${
+                          message.role === "user"
+                            ? "border-[#1f5c4d] bg-[#205f4f] text-white"
+                            : "border-[#e2e6dc] bg-white text-[#273029]"
+                        }`}
+                      >
+                        {message.role === "assistant" ? (
+                          message.content.trim() ? (
+                            <AssistantMarkdown content={message.content} />
+                          ) : showChatSpinner ? (
+                            <span className="inline-flex items-center gap-2 text-[#627064]">
+                              <Loader2 className="animate-spin" size={15} aria-hidden="true" />
+                              正在生成
+                            </span>
+                          ) : (
+                            <span className="text-xs text-[#8a9589]">（本条暂无正文）</span>
+                          )
+                        ) : (
+                          <div className="whitespace-pre-wrap">{message.content}</div>
+                        )}
+                      </div>
+                      {message.role === "user" ? <MessageAvatar role={message.role} /> : null}
+                    </article>
+                  );
+                })}
               </div>
 
               <div className="border-t border-[#e4e7dd] bg-white p-4">
                 {error ? (
-                  <div className="mb-3 rounded-md border border-[#efc6be] bg-[#fff4f1] px-3 py-2 text-sm text-[#9b3323]">
-                    {error}
+                  <div className="mb-3 flex flex-col gap-2 rounded-md border border-[#efc6be] bg-[#fff4f1] px-3 py-2 text-sm text-[#9b3323] sm:flex-row sm:items-center sm:justify-between">
+                    <span className="min-w-0 flex-1">{error}</span>
+                    {chatRetry ? (
+                      <button
+                        className="inline-flex shrink-0 items-center justify-center gap-1.5 self-start rounded-md border border-[#d4a39c] bg-white px-3 py-1.5 text-xs font-medium text-[#7a2e22] transition hover:bg-[#fff8f6] disabled:cursor-not-allowed disabled:opacity-50 sm:self-auto"
+                        disabled={isStreaming}
+                        onClick={retryChat}
+                        type="button"
+                      >
+                        <RotateCcw size={14} aria-hidden />
+                        重试
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
 

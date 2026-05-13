@@ -244,38 +244,84 @@ RAG：
 
 ### Day 5：AI Chat 产品体验
 
+**前提（你当前仓库）**：前后端已跑通；前端主入口在 `frontend/src/app/page.tsx`（含普通 Chat、`readSseStream` 解析 SSE、`AbortController` 停止、Tools 工作区）。Day 5 **以前端为主线**，后端仍以既有 `POST /api/chat/stream`（及可选 `stream-tools`）为准，尽量不扩路由。
+
+**前端今日学习路线（按顺序做，约 1 天）**
+
+1. **读透流式消费**：在 `page.tsx` 里跟一遍 `handleSubmit` → `fetch(..., { signal })` → `readSseStream` → 按事件类型更新 `messages`。能口述：`meta` / `delta` / `done` 各干什么；为什么增量用「当前助手消息 id」做 `map` 更新。
+2. **助手气泡上 Markdown**：只改**助手**侧渲染（用户气泡可继续纯文本）。安装 `react-markdown`，按需加 `remark-gfm`（表格、删除线、任务列表）。流式阶段不必等全文结束再渲染，Markdown 解析器会随字符串变长反复排版，注意性能即可（长文再考虑防抖或分段）。
+3. **代码块体验**：自定义 `components.code`：等宽字体、`overflow-x-auto`、可选「复制」按钮；语言高亮可用 `react-syntax-highlighter` 或 Shiki（二选一，先跑通再优化）。长代码块加 `max-height` + 内部滚动，避免一屏被撑死。
+4. **安全默认**：不直接把模型输出塞进 `dangerouslySetInnerHTML`；若用 `rehype-raw` 之类，必须配 **DOMPurify** 或不用 raw。外链 `<a>` 统一 `rel="noopener noreferrer"`，`target="_blank"`。
+5. **状态机落到 UI**：为每条助手消息维护显式 `status`（或从「是否最后一条 + isStreaming + error」推导），区分：等待首包、生成中、已完成、失败、用户取消。加载文案与「工具执行中」不要混用两套逻辑（Tools 区可复用同一套视觉规范）。
+6. **停止与错误**：对齐已有「停止」按钮：`abort()` 后 `isStreaming` 必须落地；`catch` 里过滤 `AbortError`，取消不要用红色错误条。网络错误展示在输入区上方，并考虑清空或保留半条助手内容的产品决策（二选一写进注释）。
+7. **重试（前端闭环）**：在错误条或助手气泡上增加「重试」：只重发**上一轮 user 内容**，新建或清空助手占位，**禁止**在旧 `id` 上拼接两次流，避免内容重复。
+8. **（加分）会话不落盘**：用 `sessionStorage` 存 `messages` JSON，挂载时 `hydrate`；注意体积与 `JSON.parse` 失败兜底。
+9. **（加分）Tools 区助手气泡**：与普通 Chat 共用同一套 Markdown/代码块组件，避免两套样式分叉。
+
+**本仓库落点（查代码从这里开始）**
+
+- `frontend/src/app/page.tsx`：消息状态、`readSseStream`、`stopStreaming` / `stopToolsStreaming`、错误区、Tailwind 气泡样式。
+- `frontend/package.json`：当前无 `react-markdown`，Day 5 会新增依赖；保持 Next 16 + React 19 兼容版本即可。
+- 同源代理：`NEXT_PUBLIC_API_BASE_URL` 与 `next.config` 里对 `/api` 的 rewrites（若为空则走同源）。
+- 后端事件形状参考 `backend/app/api/chat.py` 的 SSE `data:` JSON（`type` 字段），前端解析逻辑与之一一对应。
+
 学习内容：
 
-- Markdown 渲染
-- 代码块渲染
-- 消息状态
-- 停止生成
-- 重试
+- **Markdown 与富文本**：助手消息用 Markdown 渲染（标题、列表、链接、表格）；用户气泡可保持纯文本或轻量格式化；流式场景下「边收边渲染」与最终排版一致性的取舍。
+- **代码块**：围栏代码块、语言标签（` ```ts `）、复制按钮；可选语法高亮（如 Shiki / Prism）；长代码折叠与横向滚动，避免撑破布局。
+- **安全与 XSS**：不信任模型输出为 HTML；`dangerouslySetInnerHTML` 默认避免；若必须 HTML，先做白名单消毒（DOMPurify 等）；链接 `rel="noopener noreferrer"`、禁止 `javascript:` 协议。
+- **消息状态机**：空闲 → 发送中 → 流式生成中 → 成功 / 失败 / 已取消；每条助手消息可带 `status`（`pending` | `streaming` | `done` | `error` | `aborted`），与 UI（骨架屏、打字光标、重试按钮）一一对应。
+- **停止生成（Abort）**：`fetch` 传 `AbortController.signal`；用户点「停止」时 `abort()`；区分 `AbortError` 与普通网络错误，不把取消当成失败红条。
+- **错误与重试**：网络 / 5xx / 解析失败时展示可读错误；重试可「同一条助手消息重新请求」或「复制用户问题再发」；注意与流式增量 `setState` 的竞态（见下）。
+- **消息历史**：会话级 `messages` 数组即最小历史；刷新丢失问题用 `sessionStorage` / 后端会话 id（第 2 周再加深）；列表虚拟化在长会话时再考虑。
 
 开发任务：
 
-- 优化 Chat UI
-- 添加 loading、error、abort、retry
-- 支持消息历史
+- **前端（必做）**：在 `frontend/src/app/page.tsx` 的 Chat 工作区，助手气泡接入 Markdown + 代码块组件；完善加载 / 错误 / 取消的文案与样式；实现一轮对话的「重试」按钮。
+- **前端（选做）**：抽出 `components/chat/AssistantMessage.tsx`（或同目录）复用到 Tools 助手气泡；`sessionStorage` 会话恢复。
+- **后端**：Day 5 不要求改接口；若重试需幂等 id，可留到第 2 周再与请求 ID 一起做。
 
 产出：
 
-- 一个接近真实产品体验的 Chat UI
+- **今日最小闭环（前端）**：助手回复可渲染 Markdown 与可复制代码块；流式过程中 UI 不抖；可停止；失败可重试且不串消息。
+- **整周视角**：一个接近真实产品体验的 Chat UI：可读的结构化回复、安全的代码展示、可取消的流式生成、可恢复的错误与重试。
 
 面试要会讲：
 
 - AI 前端和普通 CRUD 前端有什么不同？
+  - **口述要点**：CRUD 多是**确定状态**：请求成功即整页数据替换。AI 前端是**长时、流式、概率**：同一操作输出长度与内容不固定；要处理**生成中、中断、重试、多模态（文本/工具/卡片）**；用户体验核心在**等待可感知、可取消、可恢复**，而不是只调一个接口拿 JSON。
 - 流式 UI 怎么避免状态错乱？
+  - **口述要点**：**消息 id 锚定**：增量只追加到「当前这一轮助手消息」；**闭包与竞态**：用 ref 存「当前请求 id」或比较 `assistantMessage.id`，丢弃过期 `read()` 回调；**StrictMode 双调用**开发时注意 effect 清理；**取消**后不再对旧 `assistant` 做 `setState`；**重试**时新建助手占位或显式重置内容，避免半条 + 半条拼接。
 
 ### Day 6-7：第 1 周整合
 
+**前提**：Day 1–5 功能已在仓库跑通。本阶段把「能跑的 demo」收成**可展示、可交接、可写进简历**的一页纸项目。
+
+学习内容：
+
+- **仓库与文档**：单仓前后端目录约定、根 README 一页启动、环境变量示例与真实密钥分离。
+- **接口契约**：REST + SSE 的路径、请求体、事件 `type`、错误码；与 OpenAPI（`/docs`）对照阅读。
+- **演示节奏**：1 分钟内讲清「问题 → 架构 → 三条用户路径（需求 / 工具 / Chat）」。
+
 开发任务：
 
-- 整理项目结构
-- 补 README
-- 补 `.env.example`
-- 补接口文档
-- 录一个 1 分钟本地 demo
+- 整理项目结构（目录职责写进 README，不必大改代码树）。
+- 补全根目录、`backend/`、`frontend/` 的 README；`frontend/.env.example` 与 `backend/.env.example` 保持可拷贝即用。
+- 补接口文档：仓库 `docs/API.md`（与 `http://127.0.0.1:8000/docs` 互补）。
+- 按 `docs/week1-demo-script.md` 录或试讲一遍约 1 分钟本地 demo。
+
+**本仓库落点**：`README.md`、`docs/API.md`、`docs/week1-demo-script.md`、`backend/.env.example`、`frontend/.env.example`。
+
+产出：
+
+- 新人按 README 可在双终端起全栈；API 有独立 Markdown + Swagger；你有一条熟练的 1 分钟 demo 话术。
+
+面试要会讲：
+
+- 第 1 周你交付了什么？
+  - **口述要点**：**全栈最小闭环**：FastAPI 暴露聊天与需求分析；Next 消费 **SSE** 与 Markdown Chat；**Tool Calling** 雏形；**API Key 仅后端**；无 Key 时需求分析与工具流仍可 **mock** 演示，流式聊天依赖真实 Key（与当前实现对齐）。
+- 接口文档放哪里、给谁看？
+  - **口述要点**：**对内** Markdown（`docs/API.md`）便于 PR/版本库与离线；**对人联调** FastAPI 自带 **OpenAPI**（`/docs`）可试请求；前后端契约以 **Pydantic schema + 实际 SSE 行**为准，文档随改随更。
 
 阶段产出：
 

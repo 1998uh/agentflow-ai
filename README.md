@@ -1,43 +1,69 @@
-# AgentFlow AI
+# AgentFlow AI（第 1 周）
 
-Two-month AI application development learning project for building an employable Agent/RAG full-stack portfolio.
+求职向 **AI Agent 全栈** 练习项目：**FastAPI** 后端 + **Next.js** 前端，涵盖 SSE 流式聊天、结构化需求分析、Tool Calling 与 Chat Markdown 体验。
 
-## Day 1 Scope
+详细学习顺序见 [`docs/ai-agent-application-learning-roadmap.md`](./docs/ai-agent-application-learning-roadmap.md)。
 
-- FastAPI backend with `/health`, `/api/chat`, and `/api/chat/stream`
-- Next.js chat workspace
-- SSE streaming from backend to frontend
-- Local mock LLM mode when no API key is configured
+## 仓库结构
 
-## Day 2 Scope
+```
+agentflow-ai/
+├── backend/          # FastAPI，OpenAI 兼容调用，SSE
+├── frontend/         # Next.js App Router，rewrite → 后端 /api
+├── docs/
+│   ├── API.md                    # HTTP / SSE 接口说明（给人读）
+│   ├── week1-demo-script.md    # 约 1 分钟录屏 / 试讲脚本
+│   └── ai-agent-application-learning-roadmap.md
+└── README.md
+```
 
-- OpenAI-compatible model provider integration in `LLMService`
-- Backend-only `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` config
-- Real non-streaming and streaming chat responses when an API key is configured
-- Mock fallback when no API key is configured
+## 环境要求
 
-## Start Backend
+- Python 3.11+（与 `backend` 依赖一致即可）
+- Node 20+（与 Next 16 一致即可）
+
+## 快速启动（两个终端）
+
+**终端 1 — 后端**
 
 ```bash
 cd backend
 python -m venv .venv
-.venv\Scripts\activate
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env
+# Windows: copy .env.example .env
+# macOS/Linux: cp .env.example .env
+cp .env.example .env   # 再编辑 .env 填入 OPENAI_API_KEY（流式聊天与 POST /api/chat 需要）
 uvicorn app.main:app --reload --port 8000
 ```
 
-## Start Frontend
+**终端 2 — 前端**
 
 ```bash
 cd frontend
 npm install
+# Windows: copy .env.example .env.local
+# macOS/Linux: cp .env.example .env.local
+cp .env.example .env.local   # 可选；默认空则同源 /api 走 rewrite
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+浏览器访问 **http://localhost:3000**。前端通过 `next.config.ts` 将 `/api/*` 转发到 `BACKEND_URL`（默认 `http://127.0.0.1:8000`）。
 
-## Learning Path
+## 文档与演示
 
-Day 3 will add prompt design and structured JSON output.
+| 文档 | 说明 |
+|------|------|
+| [docs/API.md](./docs/API.md) | 路径、请求体、SSE 事件类型 |
+| [docs/week1-demo-script.md](./docs/week1-demo-script.md) | 第 1 周约 1 分钟 demo 分镜 |
+| 后端 Swagger | 启动后打开 `http://127.0.0.1:8000/docs` |
 
+## 第 1 周阶段产出（简历一句话）
+
+> **AI Chat v1**：FastAPI + Next.js + SSE + 真实模型调用 + 工具调用雏形；需求结构化分析；前端 Markdown Chat 与重试/停止体验。
+
+## 说明
+
+- **密钥**：只放在 `backend/.env`，勿提交仓库。
+- **无 API Key**：`POST /api/requirements/analyze` 与 `POST /api/chat/stream-tools` 可走 mock；`POST /api/chat/stream` 与 `POST /api/chat` 当前需配置 Key（见 `docs/API.md`）。

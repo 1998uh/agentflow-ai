@@ -1,6 +1,6 @@
 # AgentFlow AI Backend
 
-FastAPI backend for the AgentFlow AI learning project.
+FastAPI 后端：聊天（含 SSE）、带工具的流式对话、需求结构化分析。更完整的 **HTTP / SSE 契约**见仓库根目录 [`../docs/API.md`](../docs/API.md)；联调可开 **Swagger**：`http://127.0.0.1:8000/docs`。
 
 ## Run
 
@@ -12,7 +12,7 @@ copy .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
-Without an API key, the backend uses a local mock streaming response so the full app can run on day 1.
+`POST /api/requirements/analyze` 与 `POST /api/chat/stream-tools` 在无 Key 时可走 **mock**；`POST /api/chat` 与 `POST /api/chat/stream` 需配置 `OPENAI_API_KEY`（见 `../docs/API.md`）。
 
 ## Model Provider
 
