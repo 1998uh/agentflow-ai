@@ -10,6 +10,7 @@ import {
   Send,
   Sparkles,
   User,
+  Wrench,
 } from "lucide-react";
 
 type Role = "user" | "assistant";
@@ -20,12 +21,39 @@ type ChatMessage = {
   content: string;
 };
 
-type StreamEvent = {
-  type: "meta" | "delta" | "done";
-  content?: string;
-  mocked?: boolean;
-  model?: string;
+type ToolTraceItem = {
+  toolCallId?: string;
+  name: string;
+  arguments?: Record<string, unknown>;
+  result?: string;
+  ok?: boolean;
+  phase: "running" | "done";
 };
+
+type ToolsChatMessage = {
+  id: string;
+  role: Role;
+  content: string;
+  toolTrace: ToolTraceItem[];
+};
+
+type StreamEvent =
+  | { type: "meta"; content?: string; mocked?: boolean; model?: string }
+  | { type: "delta"; content?: string; mocked?: boolean; model?: string }
+  | {
+      type: "tool_call";
+      tool_call_id?: string;
+      name: string;
+      arguments?: Record<string, unknown>;
+    }
+  | {
+      type: "tool_result";
+      tool_call_id?: string;
+      name: string;
+      content?: string;
+      ok?: boolean;
+    }
+  | { type: "done"; content?: string };
 
 type RequirementsAnalysis = {
   summary: string;
@@ -59,8 +87,25 @@ const dayThreeGoals = [
   "前端分区展示摘要、用户故事、验收标准、风险",
 ];
 
+const initialToolsMessages: ToolsChatMessage[] = [
+  {
+    id: "welcome-tools",
+    role: "assistant",
+    content:
+      "你好，这是 Day 4「Tool Calling」工作区。可以试试：让我检索项目文档、拆解任务计划，或生成 FastAPI 路由草稿。无 API Key 时会走本地 mock 工具流。",
+    toolTrace: [],
+  },
+];
+
+const dayFourGoals = [
+  "三个本地工具：search_project_docs / create_task_plan / generate_api_mock",
+  "后端多轮 tool_calls → 执行 → role=tool 写回 → 最终自然语言",
+  "POST /api/chat/stream-tools，SSE 事件含 tool_call、tool_result、delta",
+  "前端展示工具参数与返回摘要",
+];
+
 export default function Home() {
-  const [workspace, setWorkspace] = useState<"chat" | "requirements">("requirements");
+  const [workspace, setWorkspace] = useState<"chat" | "requirements" | "tools">("requirements");
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [input, setInput] = useState("用三句话解释：为什么结构化输出要在服务端做校验？");
   const [isStreaming, setIsStreaming] = useState(false);
@@ -68,6 +113,14 @@ export default function Home() {
   const [runtimeMode, setRuntimeMode] = useState("unknown");
   const [modelName, setModelName] = useState("gpt-4.1-mini");
   const abortControllerRef = useRef<AbortController | null>(null);
+
+  const [toolsMessages, setToolsMessages] = useState<ToolsChatMessage[]>(initialToolsMessages);
+  const [toolsInput, setToolsInput] = useState(
+    "先用文档检索总结 SSE，再给一个 3 阶段任务计划，最后为 POST /api/demo 写一个 FastAPI 草稿。",
+  );
+  const [toolsStreaming, setToolsStreaming] = useState(false);
+  const [toolsError, setToolsError] = useState("");
+  const toolsAbortRef = useRef<AbortController | null>(null);
 
   const [reqText, setReqText] = useState(
     "为研发团队做一个内部 Agent 平台：支持知识库问答、需求拆解、技术方案草稿与工具调用，需有基础权限与审计日志。",
@@ -78,6 +131,10 @@ export default function Home() {
 
   const canSend = useMemo(() => input.trim().length > 0 && !isStreaming, [input, isStreaming]);
   const canAnalyze = useMemo(() => reqText.trim().length > 0 && !reqLoading, [reqText, reqLoading]);
+  const canSendTools = useMemo(
+    () => toolsInput.trim().length > 0 && !toolsStreaming,
+    [toolsInput, toolsStreaming],
+  );
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -140,13 +197,15 @@ export default function Home() {
           return;
         }
 
-        setMessages((currentMessages) =>
-          currentMessages.map((message) =>
-            message.id === assistantMessage.id
-              ? { ...message, content: message.content + (eventData.content ?? "") }
-              : message,
-          ),
-        );
+        if (eventData.type === "delta") {
+          setMessages((currentMessages) =>
+            currentMessages.map((message) =>
+              message.id === assistantMessage.id
+                ? { ...message, content: message.content + (eventData.content ?? "") }
+                : message,
+            ),
+          );
+        }
       });
     } catch (caughtError) {
       if ((caughtError as Error).name !== "AbortError") {
@@ -198,6 +257,145 @@ export default function Home() {
     setIsStreaming(false);
   }
 
+  async function handleToolsSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const prompt = toolsInput.trim();
+    if (!prompt || toolsStreaming) {
+      return;
+    }
+
+    setToolsError("");
+    setToolsInput("");
+    setToolsStreaming(true);
+
+    const userMessage: ToolsChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: prompt,
+      toolTrace: [],
+    };
+    const assistantMessage: ToolsChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      toolTrace: [],
+    };
+    const nextMessages = [...toolsMessages, userMessage, assistantMessage];
+    setToolsMessages(nextMessages);
+
+    const controller = new AbortController();
+    toolsAbortRef.current = controller;
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/chat/stream-tools`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: nextMessages
+            .filter((m) => m.content.trim())
+            .map((m) => ({ role: m.role, content: m.content })),
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`请求失败：${response.status}`);
+      }
+
+      await readSseStream(response.body, (eventData) => {
+        if (eventData.type === "meta") {
+          setRuntimeMode(eventData.mocked ? "mock" : "provider");
+          setModelName(eventData.model ?? modelName);
+          return;
+        }
+
+        if (eventData.type === "done") {
+          return;
+        }
+
+        if (eventData.type === "delta") {
+          setToolsMessages((current) =>
+            current.map((m) =>
+              m.id === assistantMessage.id
+                ? { ...m, content: m.content + (eventData.content ?? "") }
+                : m,
+            ),
+          );
+          return;
+        }
+
+        if (eventData.type === "tool_call") {
+          setToolsMessages((current) =>
+            current.map((m) =>
+              m.id === assistantMessage.id
+                ? {
+                    ...m,
+                    toolTrace: [
+                      ...m.toolTrace,
+                      {
+                        toolCallId: eventData.tool_call_id,
+                        name: eventData.name,
+                        arguments: eventData.arguments,
+                        phase: "running",
+                      },
+                    ],
+                  }
+                : m,
+            ),
+          );
+          return;
+        }
+
+        if (eventData.type === "tool_result") {
+          setToolsMessages((current) =>
+            current.map((m) => {
+              if (m.id !== assistantMessage.id) {
+                return m;
+              }
+              const tid = eventData.tool_call_id;
+              const idx = m.toolTrace.findIndex((t) => t.toolCallId === tid);
+              if (idx >= 0) {
+                const trace = [...m.toolTrace];
+                trace[idx] = {
+                  ...trace[idx],
+                  result: eventData.content,
+                  ok: eventData.ok,
+                  phase: "done",
+                };
+                return { ...m, toolTrace: trace };
+              }
+              return {
+                ...m,
+                toolTrace: [
+                  ...m.toolTrace,
+                  {
+                    toolCallId: tid,
+                    name: eventData.name,
+                    result: eventData.content,
+                    ok: eventData.ok,
+                    phase: "done",
+                  },
+                ],
+              };
+            }),
+          );
+        }
+      });
+    } catch (caughtError) {
+      if ((caughtError as Error).name !== "AbortError") {
+        setToolsError((caughtError as Error).message || "请求出现异常");
+      }
+    } finally {
+      setToolsStreaming(false);
+      toolsAbortRef.current = null;
+    }
+  }
+
+  function stopToolsStreaming() {
+    toolsAbortRef.current?.abort();
+    setToolsStreaming(false);
+  }
+
   return (
     <main className="min-h-screen bg-[#f6f7f4] text-[#1f2520]">
       <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-5 px-4 py-5 lg:grid lg:grid-cols-[320px_1fr] lg:px-6">
@@ -208,7 +406,8 @@ export default function Home() {
             </div>
             <h1 className="mt-4 text-2xl font-semibold leading-tight">AgentFlow AI</h1>
             <p className="mt-2 text-sm leading-6 text-[#627064]">
-              面向求职项目的 AI Agent 应用开发训练营。今天聚焦 Prompt 分层与结构化 JSON + Pydantic 校验。
+              面向求职项目的 AI Agent 应用开发训练营。第 1 周串联 Day 3（结构化输出）与 Day 4（Tool
+              Calling），围绕同一主项目持续迭代。
             </p>
           </div>
 
@@ -218,6 +417,18 @@ export default function Home() {
               {dayThreeGoals.map((goal) => (
                 <div className="flex items-start gap-2 text-sm text-[#455047]" key={goal}>
                   <CheckCircle2 className="mt-0.5 shrink-0 text-[#27715e]" size={16} aria-hidden="true" />
+                  <span>{goal}</span>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="rounded-md border border-[#e4e7dd] bg-[#fbfcf8] p-4">
+            <h2 className="text-sm font-semibold">Day 4 目标</h2>
+            <div className="mt-3 space-y-3">
+              {dayFourGoals.map((goal) => (
+                <div className="flex items-start gap-2 text-sm text-[#455047]" key={goal}>
+                  <CheckCircle2 className="mt-0.5 shrink-0 text-[#2a6b8f]" size={16} aria-hidden="true" />
                   <span>{goal}</span>
                 </div>
               ))}
@@ -252,7 +463,13 @@ export default function Home() {
             <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
               <div>
                 <p className="text-sm text-[#627064]">AI Application Workspace</p>
-                <h2 className="text-xl font-semibold">Day 3 · Prompt 与结构化输出</h2>
+                <h2 className="text-xl font-semibold">
+                  {workspace === "requirements"
+                    ? "Day 3 · Prompt 与结构化输出"
+                    : workspace === "tools"
+                      ? "Day 4 · Tool Calling"
+                      : "SSE 聊天"}
+                </h2>
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
@@ -266,6 +483,18 @@ export default function Home() {
                 >
                   <ClipboardList size={16} aria-hidden="true" />
                   需求分析
+                </button>
+                <button
+                  className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition ${
+                    workspace === "tools"
+                      ? "border-[#205f4f] bg-[#e4efe8] text-[#17483c]"
+                      : "border-[#dfe3d8] text-[#455047] hover:bg-[#f2f4ef]"
+                  }`}
+                  onClick={() => setWorkspace("tools")}
+                  type="button"
+                >
+                  <Wrench size={16} aria-hidden="true" />
+                  工具调用
                 </button>
                 <button
                   className={`inline-flex items-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition ${
@@ -360,6 +589,90 @@ export default function Home() {
                 </form>
               </div>
             </div>
+          ) : workspace === "tools" ? (
+            <>
+              <div className="flex flex-1 flex-col overflow-hidden bg-[#fbfcf8]">
+                <div className="flex-1 space-y-4 overflow-y-auto p-5">
+                  <p className="text-sm leading-6 text-[#627064]">
+                    调用{" "}
+                    <span className="font-mono text-[#273029]">POST /api/chat/stream-tools</span>
+                    ，SSE 中可穿插 <span className="font-mono">tool_call</span> /{" "}
+                    <span className="font-mono">tool_result</span>
+                    。无 API Key 时由后端 mock 演示三路工具。
+                  </p>
+                  {toolsMessages.map((message, index) => {
+                    const isLastAssistant =
+                      message.role === "assistant" && index === toolsMessages.length - 1;
+                    return (
+                      <article
+                        className={`flex gap-3 ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                        key={message.id}
+                      >
+                        {message.role === "assistant" ? (
+                          <MessageAvatar role={message.role} />
+                        ) : null}
+                        <div
+                          className={`max-w-[780px] rounded-lg border px-4 py-3 text-sm leading-6 shadow-sm ${
+                            message.role === "user"
+                              ? "border-[#1f5c4d] bg-[#205f4f] text-white"
+                              : "border-[#e2e6dc] bg-white text-[#273029]"
+                          }`}
+                        >
+                          {message.role === "assistant" && message.toolTrace.length > 0 ? (
+                            <ToolTraceList trace={message.toolTrace} />
+                          ) : null}
+                          {message.content ? (
+                            <div className="whitespace-pre-wrap">{message.content}</div>
+                          ) : message.role === "assistant" && toolsStreaming && isLastAssistant ? (
+                            <span className="inline-flex items-center gap-2 text-[#627064]">
+                              <Loader2 className="animate-spin" size={15} aria-hidden="true" />
+                              {message.toolTrace.some((t) => t.phase === "running")
+                                ? "正在执行工具…"
+                                : "等待模型回复…"}
+                            </span>
+                          ) : null}
+                        </div>
+                        {message.role === "user" ? <MessageAvatar role={message.role} /> : null}
+                      </article>
+                    );
+                  })}
+                </div>
+
+                <div className="border-t border-[#e4e7dd] bg-white p-4">
+                  {toolsError ? (
+                    <div className="mb-3 rounded-md border border-[#efc6be] bg-[#fff4f1] px-3 py-2 text-sm text-[#9b3323]">
+                      {toolsError}
+                    </div>
+                  ) : null}
+                  <form className="flex flex-col gap-3 md:flex-row" onSubmit={handleToolsSubmit}>
+                    <textarea
+                      className="min-h-24 flex-1 resize-none rounded-md border border-[#cfd6ca] bg-white px-4 py-3 text-sm leading-6 outline-none transition focus:border-[#27715e] focus:ring-2 focus:ring-[#27715e]/15"
+                      onChange={(event) => setToolsInput(event.target.value)}
+                      placeholder="描述任务：可要求文档检索、任务计划、FastAPI 草稿等…"
+                      value={toolsInput}
+                    />
+                    <div className="flex gap-2 md:w-32 md:flex-col">
+                      <button
+                        className="inline-flex h-11 flex-1 items-center justify-center gap-2 rounded-md bg-[#205f4f] px-4 text-sm font-medium text-white transition hover:bg-[#17483c] disabled:cursor-not-allowed disabled:bg-[#9daaa1] md:flex-none"
+                        disabled={!canSendTools}
+                        type="submit"
+                      >
+                        {toolsStreaming ? <Loader2 className="animate-spin" size={17} /> : <Wrench size={17} />}
+                        发送
+                      </button>
+                      <button
+                        className="h-11 flex-1 rounded-md border border-[#cfd6ca] px-4 text-sm font-medium text-[#455047] transition hover:bg-[#f2f4ef] disabled:cursor-not-allowed disabled:text-[#9daaa1] md:flex-none"
+                        disabled={!toolsStreaming}
+                        onClick={stopToolsStreaming}
+                        type="button"
+                      >
+                        停止
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </>
           ) : (
             <>
               <div className="flex-1 space-y-4 overflow-y-auto bg-[#fbfcf8] p-5">
@@ -429,6 +742,40 @@ export default function Home() {
         </section>
       </div>
     </main>
+  );
+}
+
+function ToolTraceList({ trace }: { trace: ToolTraceItem[] }) {
+  return (
+    <div className="mb-3 space-y-2">
+      {trace.map((item, index) => (
+        <div
+          key={`${item.toolCallId ?? "call"}-${index}-${item.name}`}
+          className="rounded-md border border-[#d8ded0] bg-[#f4f7f0] px-3 py-2 text-left"
+        >
+          <div className="flex items-center justify-between gap-2 text-xs text-[#273029]">
+            <span className="font-semibold">{item.name}</span>
+            {item.phase === "running" ? (
+              <Loader2 className="animate-spin text-[#27715e]" size={14} aria-hidden="true" />
+            ) : item.ok === false ? (
+              <span className="text-[#9b3323]">失败</span>
+            ) : (
+              <span className="text-[#27715e]">完成</span>
+            )}
+          </div>
+          {item.arguments && Object.keys(item.arguments).length > 0 ? (
+            <pre className="mt-2 max-h-28 overflow-auto text-[11px] leading-4 text-[#455047]">
+              {JSON.stringify(item.arguments, null, 2)}
+            </pre>
+          ) : null}
+          {item.result !== undefined ? (
+            <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-4 text-[#455047]">
+              {item.result}
+            </pre>
+          ) : null}
+        </div>
+      ))}
+    </div>
   );
 }
 
