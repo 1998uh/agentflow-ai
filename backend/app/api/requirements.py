@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 
+from app.core.errors import AppError, ErrorCode
 from app.schemas.requirements import (
     RequirementsAnalyzeRequest,
     RequirementsAnalyzeResponse,
@@ -17,7 +18,11 @@ async def analyze_requirements(
     try:
         analysis, mocked = await llm.analyze_requirements(payload.description)
     except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        raise AppError(
+            code=ErrorCode.LLM_BAD_OUTPUT,
+            status_code=502,
+            message=str(exc),
+        ) from exc
 
     return RequirementsAnalyzeResponse(
         analysis=analysis,

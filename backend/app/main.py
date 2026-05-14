@@ -12,6 +12,7 @@ load_dotenv(_BACKEND_ROOT / ".env")
 from app.api.chat import router as chat_router
 from app.api.requirements import router as requirements_router
 from app.core.config import get_settings
+from app.core.errors import AppError, app_error_handler
 
 settings = get_settings()
 
@@ -48,6 +49,7 @@ def _configure_app_logging() -> None:
 _configure_app_logging()
 
 app = FastAPI(title=settings.app_name)
+app.add_exception_handler(AppError, app_error_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],

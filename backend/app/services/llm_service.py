@@ -63,10 +63,10 @@ class LLMService:
                 messages=self._to_provider_messages(messages),
             )
         except APIError as exc:
-            return self._provider_error_message(exc)
+            raise ValueError(self._provider_error_message(exc)) from exc
 
         if isinstance(response, str):
-            return self._unexpected_provider_response_message(response)
+            raise ValueError(self._unexpected_provider_response_message(response))
 
         message = response.choices[0].message
         return message.content or getattr(message, "reasoning_content", "") or ""
