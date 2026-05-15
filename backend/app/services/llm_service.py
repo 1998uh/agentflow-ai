@@ -4,7 +4,7 @@ import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
-from openai import APIError, AsyncOpenAI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from app.core.config import get_settings
@@ -19,6 +19,7 @@ from app.services.agent_tools import (
 log = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 6
+_RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
 
 _TOOLS_SYSTEM = """你是 AgentFlow AI 的研发助手，可使用工具完成事实检索与可执行产物草稿。
 规则：
@@ -56,9 +57,9 @@ class LLMService:
         if self.is_mock_mode():
             return self._mock_answer(messages)
 
-        client = self._provider_client()
         try:
-            response = await client.chat.completions.create(
+            response = await self._create_chat_completion(
+                "chat.complete",
                 model=self.settings.openai_model,
                 messages=self._to_provider_messages(messages),
             )
@@ -75,10 +76,9 @@ class LLMService:
         if self.is_mock_mode():
             return self._mock_requirements_analysis(description), True
 
-        client = self._provider_client()
         messages = self._requirements_messages(description)
         log.debug("analyze_requirements messages=%s", messages)
-        raw = await self._complete_as_json_object(client, messages)
+        raw = await self._complete_as_json_object(messages)
         try:
             return self._parse_requirements_json(raw), False
         except ValidationError as first_error:
@@ -95,7 +95,7 @@ class LLMService:
                     ),
                 },
             ]
-            raw_retry = await self._complete_as_json_object(client, repair_messages)
+            raw_retry = await self._complete_as_json_object(repair_messages)
             try:
                 return self._parse_requirements_json(raw_retry), False
             except ValidationError as second_error:
@@ -118,7 +118,6 @@ class LLMService:
             log.info("stream_with_tools(mock) done")
             return
 
-        client = self._provider_client()
         api_messages: list[dict[str, Any]] = self._messages_with_tools_system(messages)
         log.debug(
             "stream_with_tools provider_messages=%d roles=%s",
@@ -134,7 +133,8 @@ class LLMService:
                 len(api_messages),
             )
             try:
-                response = await client.chat.completions.create(
+                response = await self._create_chat_completion(
+                    "chat.stream_tools",
                     model=self.settings.openai_model,
                     messages=api_messages,
                     tools=OPENAI_TOOL_DEFINITIONS,
@@ -253,9 +253,9 @@ class LLMService:
                 yield token
             return
 
-        client = self._provider_client()
         try:
-            stream = await client.chat.completions.create(
+            stream = await self._create_chat_completion(
+                "chat.stream",
                 model=self.settings.openai_model,
                 messages=self._to_provider_messages(messages),
                 stream=True,
@@ -268,14 +268,17 @@ class LLMService:
             yield self._unexpected_provider_response_message(stream)
             return
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
 
-            delta_obj = chunk.choices[0].delta
-            delta = delta_obj.content or getattr(delta_obj, "reasoning_content", "")
-            if delta:
-                yield delta
+                delta_obj = chunk.choices[0].delta
+                delta = delta_obj.content or getattr(delta_obj, "reasoning_content", "")
+                if delta:
+                    yield delta
+        except (APITimeoutError, APIConnectionError, APIStatusError, APIError) as exc:
+            yield self._provider_error_message(exc)
 
     def _mock_answer(self, messages: list[ChatMessage]) -> str:
         latest_user_message = next(
@@ -299,6 +302,8 @@ class LLMService:
         return AsyncOpenAI(
             api_key=self.settings.openai_api_key,
             base_url=self._openai_client_base_url(),
+            timeout=self.settings.llm_request_timeout_seconds,
+            max_retries=0,
         )
 
     def _provider_client(self) -> AsyncOpenAI:
@@ -411,13 +416,57 @@ class LLMService:
             f"response preview: {preview}"
         )
 
+    async def _create_chat_completion(self, operation: str, **kwargs: Any) -> Any:
+        max_attempts = max(1, self.settings.llm_max_retries + 1)
+        for attempt_index in range(max_attempts):
+            try:
+                return await self._provider_client().chat.completions.create(**kwargs)
+            except (APITimeoutError, APIConnectionError, APIStatusError, APIError) as exc:
+                attempt_number = attempt_index + 1
+                should_retry = self._is_retryable_provider_error(exc)
+                if not should_retry or attempt_number >= max_attempts:
+                    log.warning(
+                        "provider call failed operation=%s attempt=%d/%d retryable=%s err=%s",
+                        operation,
+                        attempt_number,
+                        max_attempts,
+                        should_retry,
+                        self._provider_error_message(exc),
+                    )
+                    raise
+
+                delay = self._retry_delay_seconds(attempt_index)
+                log.warning(
+                    "provider call retrying operation=%s attempt=%d/%d delay=%.2fs err=%s",
+                    operation,
+                    attempt_number,
+                    max_attempts,
+                    delay,
+                    self._provider_error_message(exc),
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError("unreachable provider retry state")
+
+    def _is_retryable_provider_error(self, exc: APIError) -> bool:
+        if isinstance(exc, (APITimeoutError, APIConnectionError)):
+            return True
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            return True
+        return status_code in _RETRYABLE_STATUS_CODES
+
+    def _retry_delay_seconds(self, attempt_index: int) -> float:
+        base_delay = max(0.0, self.settings.llm_retry_backoff_seconds)
+        return base_delay * (2**attempt_index)
+
     async def _complete_as_json_object(
         self,
-        client: AsyncOpenAI,
         messages: list[dict[str, str]],
     ) -> str:
         try:
-            response = await client.chat.completions.create(
+            response = await self._create_chat_completion(
+                "requirements.json",
                 model=self.settings.openai_model,
                 messages=messages,
                 response_format={"type": "json_object"},
@@ -426,7 +475,8 @@ class LLMService:
             status = getattr(exc, "status_code", None)
             if status in (400, 422):
                 try:
-                    response = await client.chat.completions.create(
+                    response = await self._create_chat_completion(
+                        "requirements.text_fallback",
                         model=self.settings.openai_model,
                         messages=messages,
                     )

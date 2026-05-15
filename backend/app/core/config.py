@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.deepseek.com"
     # 可被环境变量 OPENAI_MODEL 覆盖；用 OpenAI 官方时改为如 gpt-4o-mini
     openai_model: str = "deepseek-chat"
+    llm_request_timeout_seconds: float = 20.0
+    llm_max_retries: int = 2
+    llm_retry_backoff_seconds: float = 0.5
     frontend_origin: str = "http://localhost:3000"
 
     model_config = SettingsConfigDict(

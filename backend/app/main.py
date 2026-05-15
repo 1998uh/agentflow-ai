@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_BACKEND_ROOT / ".env")
+load_dotenv(_BACKEND_ROOT / ".env", override=True)
 
 from app.api.chat import router as chat_router
 from app.api.requirements import router as requirements_router
