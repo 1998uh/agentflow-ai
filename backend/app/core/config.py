@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     llm_request_timeout_seconds: float = 20.0
     llm_max_retries: int = 2
     llm_retry_backoff_seconds: float = 0.5
+    sqlite_database_path: str = str(_BACKEND_ROOT / "data" / "agentflow_sessions.sqlite3")
     frontend_origin: str = "http://localhost:3000"
 
     model_config = SettingsConfigDict(

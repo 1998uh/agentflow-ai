@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -418,9 +419,20 @@ class LLMService:
 
     async def _create_chat_completion(self, operation: str, **kwargs: Any) -> Any:
         max_attempts = max(1, self.settings.llm_max_retries + 1)
+        started_at = time.perf_counter()
         for attempt_index in range(max_attempts):
             try:
-                return await self._provider_client().chat.completions.create(**kwargs)
+                response = await self._provider_client().chat.completions.create(**kwargs)
+                duration_ms = (time.perf_counter() - started_at) * 1000
+                self._log_provider_usage(
+                    operation=operation,
+                    model=str(kwargs.get("model", self.settings.openai_model)),
+                    attempt_number=attempt_index + 1,
+                    max_attempts=max_attempts,
+                    duration_ms=duration_ms,
+                    response=response,
+                )
+                return response
             except (APITimeoutError, APIConnectionError, APIStatusError, APIError) as exc:
                 attempt_number = attempt_index + 1
                 should_retry = self._is_retryable_provider_error(exc)
@@ -447,6 +459,41 @@ class LLMService:
                 await asyncio.sleep(delay)
 
         raise RuntimeError("unreachable provider retry state")
+
+    def _log_provider_usage(
+        self,
+        *,
+        operation: str,
+        model: str,
+        attempt_number: int,
+        max_attempts: int,
+        duration_ms: float,
+        response: Any,
+    ) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            log.info(
+                "provider call usage_missing operation=%s model=%s attempt=%d/%d duration_ms=%.0f",
+                operation,
+                model,
+                attempt_number,
+                max_attempts,
+                duration_ms,
+            )
+            return
+
+        log.info(
+            "provider call usage operation=%s model=%s attempt=%d/%d duration_ms=%.0f "
+            "prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            operation,
+            model,
+            attempt_number,
+            max_attempts,
+            duration_ms,
+            getattr(usage, "prompt_tokens", None),
+            getattr(usage, "completion_tokens", None),
+            getattr(usage, "total_tokens", None),
+        )
 
     def _is_retryable_provider_error(self, exc: APIError) -> bool:
         if isinstance(exc, (APITimeoutError, APIConnectionError)):
